@@ -70,6 +70,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     apply_rollout_correction_to_diffusion_batch,
     rollout_correction_enabled,
 )
+from verl_omni.utils.benchmark_timing import BenchmarkTiming
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
 sys_logger = logging.getLogger(__name__)
@@ -668,6 +669,7 @@ class BaseRayDiffusionTrainer(ABC):
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        self._reward_overlaps_rollout = enable_agent_reward_loop
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -942,9 +944,10 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
             else False
         )
         next_step_profile = False
+        benchmark_timing = BenchmarkTiming.from_env("verl_omni")
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in benchmark_timing.iter_batches(self.train_dataloader, lambda: self.global_steps):
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -957,29 +960,30 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         else curr_step_profile
                     )
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                with benchmark_timing.measure("data_prepare"):
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                    # add uid to batch
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
 
-                gen_batch = self._get_gen_batch(batch)
+                    gen_batch = self._get_gen_batch(batch)
 
-                # Pass step metadata to rollout before expansion.
-                gen_batch.meta_info["global_steps"] = self.global_steps
+                    # Pass step metadata to rollout before expansion.
+                    gen_batch.meta_info["global_steps"] = self.global_steps
 
-                # Per-step rollout seed for reproducibility
-                rollout_seed_cfg = self.config.actor_rollout_ref.rollout.get("seed")
-                if rollout_seed_cfg is not None:
-                    gen_batch.meta_info["rollout_seed"] = int(rollout_seed_cfg) + self.global_steps - 1
+                    # Per-step rollout seed for reproducibility
+                    rollout_seed_cfg = self.config.actor_rollout_ref.rollout.get("seed")
+                    if rollout_seed_cfg is not None:
+                        gen_batch.meta_info["rollout_seed"] = int(rollout_seed_cfg) + self.global_steps - 1
 
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
-                gen_batch_output.non_tensor_batch["_rollout_seed_global_idx"] = np.arange(
-                    len(gen_batch_output), dtype=np.int64
-                )
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
+                    gen_batch_output.non_tensor_batch["_rollout_seed_global_idx"] = np.arange(
+                        len(gen_batch_output), dtype=np.int64
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -987,26 +991,38 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
+                        rollout_phase = (
+                            "rollout_generate_reward_inclusive"
+                            if self._reward_overlaps_rollout
+                            else "rollout_generate"
+                        )
+                        with benchmark_timing.measure(rollout_phase):
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        with benchmark_timing.measure("rollout_sleep"):
+                            self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                    benchmark_timing.set_zero("rollout_wake")
+                    benchmark_timing.set_zero("model_offload")
+                    benchmark_timing.set_zero("model_onload")
 
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
+                        reward_phase = "reward_extract" if self._reward_overlaps_rollout else "reward"
+                        with benchmark_timing.measure(reward_phase):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                batch_reward = self._compute_reward_colocate(batch)
+                                batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Bypass mode: skip old_log_prob recompute (2 policies).
                     # Decoupled mode: recompute old_log_probs as proximal anchor (3 policies).
@@ -1014,12 +1030,14 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         apply_bypass_mode_to_diffusion_batch(batch)
+                        benchmark_timing.set_zero("policy_anchor")
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            if old_log_prob_mfu is not None:
-                                metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
-                            batch = batch.union(old_log_prob)
+                            with benchmark_timing.measure("policy_anchor"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                if old_log_prob_mfu is not None:
+                                    metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
+                                batch = batch.union(old_log_prob)
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -1039,34 +1057,38 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                             batch = batch.union(ref_log_prob)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        batch.batch["sample_level_scores"] = reward_tensor
+                        with benchmark_timing.measure("advantage"):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            batch.batch["sample_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update(
+                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                )
 
-                        num_timesteps = batch.batch["old_log_probs"].shape[1]
-                        batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
-                            -1, num_timesteps
-                        )
+                            num_timesteps = batch.batch["old_log_probs"].shape[1]
+                            batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
+                                -1, num_timesteps
+                            )
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            global_std=self.config.algorithm.global_std,
-                            config=self.config.algorithm,
-                        )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                global_std=self.config.algorithm.global_std,
+                                config=self.config.algorithm,
+                            )
 
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
-                        actor_output = self._update_actor(batch)
+                        with benchmark_timing.measure("actor_update"):
+                            actor_output = self._update_actor(batch)
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(
@@ -1092,8 +1114,10 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
                     # update weights from trainer to rollout
                     with marked_timer("update_weights", timing_raw, color="red"):
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                        with benchmark_timing.measure("weight_sync"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
 
+                    benchmark_timing.begin("bookkeeping")
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 
@@ -1150,6 +1174,8 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+                benchmark_timing.end("bookkeeping")
+                benchmark_timing.end_step(metadata={"reward_overlapped": self._reward_overlaps_rollout})
                 self.global_steps += 1
 
                 if is_last_step:
@@ -1157,6 +1183,7 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    benchmark_timing.close()
                     return
 
                 # this is experimental and may be changed/removed in the future
