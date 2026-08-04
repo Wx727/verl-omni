@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Iterator, Optional
 
 _COMMON_PHASES = (
     "data_prepare",
@@ -33,17 +33,18 @@ class BenchmarkTiming:
         self.framework = framework
         self.output_path = Path(output_path).expanduser() if output_path else None
         self.enabled = self.output_path is not None
-        self._records: list[Dict[str, Any]] = []
+        self._records: list[dict[str, Any]] = []
         self._step: Optional[int] = None
-        self._phases_ns: Dict[str, int] = {}
-        self._open_phases_ns: Dict[str, int] = {}
+        self._phases_ns: dict[str, int] = {}
+        self._details_ns: dict[str, int] = {}
+        self._open_phases_ns: dict[str, int] = {}
         self._last_step_end_ns: Optional[int] = None
         self._closed = False
         if self.enabled:
             atexit.register(self.close)
 
     @classmethod
-    def from_env(cls, framework: str) -> "BenchmarkTiming":
+    def from_env(cls, framework: str) -> BenchmarkTiming:
         return cls(framework, os.environ.get("BENCH_TIMING_JSONL"))
 
     def start_step(self, step: int) -> None:
@@ -53,6 +54,7 @@ class BenchmarkTiming:
             raise RuntimeError(f"benchmark timing step {self._step} is still active")
         self._step = int(step)
         self._phases_ns = {}
+        self._details_ns = {}
         self._open_phases_ns = {}
 
     def cancel_step(self) -> None:
@@ -60,6 +62,7 @@ class BenchmarkTiming:
             return
         self._step = None
         self._phases_ns = {}
+        self._details_ns = {}
         self._open_phases_ns = {}
 
     @contextmanager
@@ -93,6 +96,14 @@ class BenchmarkTiming:
             raise RuntimeError(f"benchmark timing phase {name!r} recorded outside a step")
         self._phases_ns[name] = self._phases_ns.get(name, 0) + int(elapsed_ns)
 
+    def add_detail_ns(self, name: str, elapsed_ns: int) -> None:
+        """Record a nested diagnostic without double-counting ``measured_s``."""
+        if not self.enabled:
+            return
+        if self._step is None:
+            raise RuntimeError(f"benchmark timing detail {name!r} recorded outside a step")
+        self._details_ns[name] = self._details_ns.get(name, 0) + int(elapsed_ns)
+
     def set_zero(self, name: str) -> None:
         if self.enabled and self._step is not None:
             self._phases_ns.setdefault(name, 0)
@@ -110,7 +121,7 @@ class BenchmarkTiming:
                 return
             yield item
 
-    def end_step(self, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def end_step(self, *, metadata: Optional[dict[str, Any]] = None) -> None:
         if not self.enabled:
             return
         if self._step is None:
@@ -121,6 +132,10 @@ class BenchmarkTiming:
         step_end_ns = time.perf_counter_ns()
         cycle_ns = None if self._last_step_end_ns is None else step_end_ns - self._last_step_end_ns
         phases_s = {f"{name}_s": elapsed_ns / 1e9 for name, elapsed_ns in self._phases_ns.items()}
+        details_s = {f"{name}_s": elapsed_ns / 1e9 for name, elapsed_ns in self._details_ns.items()}
+        overlap = set(phases_s).intersection(details_s)
+        if overlap:
+            raise RuntimeError(f"benchmark timing detail names collide with phases: {sorted(overlap)}")
         for name in _COMMON_PHASES:
             phases_s.setdefault(f"{name}_s", None)
 
@@ -141,6 +156,7 @@ class BenchmarkTiming:
                 "step_end_ns": step_end_ns,
                 "cycle_s": cycle_s,
                 **phases_s,
+                **details_s,
                 "rollout_total_s": rollout_total_s,
                 "measured_s": measured_s,
                 "residual_s": residual_s,
@@ -150,6 +166,7 @@ class BenchmarkTiming:
         self._last_step_end_ns = step_end_ns
         self._step = None
         self._phases_ns = {}
+        self._details_ns = {}
 
     def close(self) -> None:
         if not self.enabled or self._closed:

@@ -364,7 +364,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
-                actor_output = self.train_batch(mini_batch_td)
+                record_update = (
+                    self.profiler_config is not None and bool(getattr(self.profiler_config, "enable", False))
+                )
+                update_scope = (
+                    torch.profiler.record_function(f"optimizer_update_{batch_idx}")
+                    if record_update
+                    else nullcontext()
+                )
+                with update_scope:
+                    actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -765,8 +774,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        timing_enabled = bool(tu.pop(data, key="benchmark_actor_timing", default=False))
+        worker_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        train_start_ns = time.perf_counter_ns() if timing_enabled else 0
         output = self.actor.train_mini_batch(data=data)
-        return output.cpu() if output is not None else None
+        train_ns = time.perf_counter_ns() - train_start_ns if timing_enabled else 0
+        to_cpu_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        output = output.cpu() if output is not None else None
+        to_cpu_ns = time.perf_counter_ns() - to_cpu_start_ns if timing_enabled else 0
+        worker_total_ns = time.perf_counter_ns() - worker_start_ns if timing_enabled else 0
+        if output is not None and timing_enabled:
+            metrics = tu.get(output, "metrics")
+            metrics["__benchmark_actor_worker_updates_ns"] = train_ns
+            metrics["__benchmark_actor_worker_to_cpu_ns"] = to_cpu_ns
+            metrics["__benchmark_actor_worker_total_ns"] = worker_total_ns
+        return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def copy_adapter(self, source: str = "default", target: str = "old"):

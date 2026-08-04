@@ -19,6 +19,7 @@ This trainer supports model-agnostic model initialization with Hugging Face.
 import json
 import logging
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -796,6 +797,8 @@ class BaseRayDiffusionTrainer(ABC):
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        timing_enabled = bool(os.environ.get("BENCH_TIMING_JSONL"))
+        prepare_start_ns = time.perf_counter_ns() if timing_enabled else 0
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # update actor
@@ -817,14 +820,49 @@ class BaseRayDiffusionTrainer(ABC):
             height=self.config.actor_rollout_ref.model.pipeline.height,
             width=self.config.actor_rollout_ref.model.pipeline.width,
             vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+            benchmark_actor_timing=timing_enabled,
         )
+        prepare_ns = time.perf_counter_ns() - prepare_start_ns if timing_enabled else 0
 
+        rpc_start_ns = time.perf_counter_ns() if timing_enabled else 0
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        rpc_ns = time.perf_counter_ns() - rpc_start_ns if timing_enabled else 0
+        postprocess_start_ns = time.perf_counter_ns() if timing_enabled else 0
         actor_output = tu.get(actor_output, "metrics")
+        worker_timings_ns = {}
+        for metric_key, detail_name in (
+            ("__benchmark_actor_worker_updates_ns", "actor_worker_updates"),
+            ("__benchmark_actor_worker_to_cpu_ns", "actor_worker_to_cpu"),
+            ("__benchmark_actor_worker_total_ns", "actor_worker_total"),
+        ):
+            value = actor_output.pop(metric_key, None)
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    value = value.max().item()
+                elif isinstance(value, (list, tuple)):
+                    value = max(value)
+                worker_timings_ns[detail_name] = int(value)
         actor_output = rename_dict(actor_output, "actor/")
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
             actor_output["perf/mfu/actor"] = actor_mfu
-        return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+        postprocess_ns = time.perf_counter_ns() - postprocess_start_ns if timing_enabled else 0
+        worker_total_ns = worker_timings_ns.get("actor_worker_total")
+        timing_ns = (
+            {
+                "actor_driver_prepare": prepare_ns,
+                "actor_driver_rpc": rpc_ns,
+                "actor_driver_postprocess": postprocess_ns,
+                **worker_timings_ns,
+            }
+            if timing_enabled
+            else {}
+        )
+        if worker_total_ns is not None:
+            timing_ns["actor_rpc_overhead"] = max(0, rpc_ns - worker_total_ns)
+        return DataProto.from_single_dict(
+            data={},
+            meta_info={"metrics": actor_output, "benchmark_timing_ns": timing_ns},
+        )
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1089,6 +1127,8 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                     with marked_timer("update_actor", timing_raw, color="red"):
                         with benchmark_timing.measure("actor_update"):
                             actor_output = self._update_actor(batch)
+                    for name, elapsed_ns in actor_output.meta_info.pop("benchmark_timing_ns", {}).items():
+                        benchmark_timing.add_detail_ns(name, int(elapsed_ns))
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(
