@@ -71,6 +71,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     apply_rollout_correction_to_diffusion_batch,
     rollout_correction_enabled,
 )
+from verl_omni.utils.benchmark_dispatch_timing import capture_actor_dispatch_timing
 from verl_omni.utils.benchmark_timing import BenchmarkTiming
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
@@ -802,9 +803,14 @@ class BaseRayDiffusionTrainer(ABC):
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # update actor
+        to_tensordict_start_ns = time.perf_counter_ns() if timing_enabled else 0
         batch_td = batch.to_tensordict()
+        to_tensordict_ns = time.perf_counter_ns() - to_tensordict_start_ns if timing_enabled else 0
         # step 2: convert from padding to no-padding
+        remove_padding_start_ns = time.perf_counter_ns() if timing_enabled else 0
         batch_td = embeds_padding_2_no_padding(batch_td)
+        remove_padding_ns = time.perf_counter_ns() - remove_padding_start_ns if timing_enabled else 0
+        assign_metadata_start_ns = time.perf_counter_ns() if timing_enabled else 0
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -822,10 +828,12 @@ class BaseRayDiffusionTrainer(ABC):
             vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
             benchmark_actor_timing=timing_enabled,
         )
+        assign_metadata_ns = time.perf_counter_ns() - assign_metadata_start_ns if timing_enabled else 0
         prepare_ns = time.perf_counter_ns() - prepare_start_ns if timing_enabled else 0
 
         rpc_start_ns = time.perf_counter_ns() if timing_enabled else 0
-        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        with capture_actor_dispatch_timing(timing_enabled) as dispatch_timings_ns:
+            actor_output = self.actor_rollout_wg.update_actor(batch_td)
         rpc_ns = time.perf_counter_ns() - rpc_start_ns if timing_enabled else 0
         postprocess_start_ns = time.perf_counter_ns() if timing_enabled else 0
         actor_output = tu.get(actor_output, "metrics")
@@ -850,8 +858,16 @@ class BaseRayDiffusionTrainer(ABC):
         timing_ns = (
             {
                 "actor_driver_prepare": prepare_ns,
+                "actor_prepare_to_tensordict": to_tensordict_ns,
+                "actor_prepare_remove_padding": remove_padding_ns,
+                "actor_prepare_assign_metadata": assign_metadata_ns,
+                "actor_prepare_misc": prepare_ns
+                - to_tensordict_ns
+                - remove_padding_ns
+                - assign_metadata_ns,
                 "actor_driver_rpc": rpc_ns,
                 "actor_driver_postprocess": postprocess_ns,
+                **dispatch_timings_ns,
                 **worker_timings_ns,
             }
             if timing_enabled
@@ -859,6 +875,12 @@ class BaseRayDiffusionTrainer(ABC):
         )
         if worker_total_ns is not None:
             timing_ns["actor_rpc_overhead"] = max(0, rpc_ns - worker_total_ns)
+            execute_wait_ns = dispatch_timings_ns.get("actor_execute_wait")
+            if execute_wait_ns is not None:
+                timing_ns["actor_execute_wait_overhead"] = execute_wait_ns - worker_total_ns
+        dispatch_pipeline_ns = dispatch_timings_ns.get("actor_dispatch_pipeline_total")
+        if dispatch_pipeline_ns is not None:
+            timing_ns["actor_rpc_wrapper_residual"] = rpc_ns - dispatch_pipeline_ns
         return DataProto.from_single_dict(
             data={},
             meta_info={"metrics": actor_output, "benchmark_timing_ns": timing_ns},
