@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import os
 import random
 from typing import Any, Optional
 
@@ -118,7 +119,21 @@ class DiffusionAgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
 
-        self.max_prompt_embed_length = self.rollout_config.pipeline.max_sequence_length
+        prompt_embed_length_override = os.environ.get("VERL_PROMPT_EMBED_LENGTH")
+        self.max_prompt_embed_length = (
+            int(prompt_embed_length_override)
+            if prompt_embed_length_override is not None
+            else self.rollout_config.pipeline.max_sequence_length
+        )
+        if self.max_prompt_embed_length <= 0:
+            raise ValueError(f"max_prompt_embed_length must be positive, got {self.max_prompt_embed_length}")
+        if prompt_embed_length_override is not None:
+            print(
+                "BENCH_PROMPT_EMBED_LENGTH "
+                f"pipeline_max_sequence_length={self.rollout_config.pipeline.max_sequence_length} "
+                f"final_prompt_embed_length={self.max_prompt_embed_length}",
+                flush=True,
+            )
 
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:
