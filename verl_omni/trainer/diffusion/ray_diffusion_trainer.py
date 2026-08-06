@@ -806,9 +806,34 @@ class BaseRayDiffusionTrainer(ABC):
         to_tensordict_start_ns = time.perf_counter_ns() if timing_enabled else 0
         batch_td = batch.to_tensordict()
         to_tensordict_ns = time.perf_counter_ns() - to_tensordict_start_ns if timing_enabled else 0
+        disable_prompt_unpadding = os.environ.get("VERL_DISABLE_PROMPT_UNPADDING") == "1"
+        if os.environ.get("BENCH_PROMPT_PADDING_STATS") == "1":
+            for branch, mask_key in (
+                ("positive", "prompt_embeds_mask"),
+                ("negative", "negative_prompt_embeds_mask"),
+            ):
+                mask = batch_td.get(mask_key, None)
+                if not isinstance(mask, torch.Tensor) or mask.is_nested or mask.ndim < 2:
+                    continue
+                flat_mask = mask.to(dtype=torch.bool).reshape(mask.shape[0], -1)
+                valid_per_sample = flat_mask.sum(dim=-1)
+                valid_tokens = int(valid_per_sample.sum().item())
+                total_tokens = int(flat_mask.numel())
+                sys_logger.warning(
+                    "BENCH_PROMPT_PADDING branch=%s batch=%d seq_len=%d "
+                    "valid_mean=%.3f valid_max=%d padding_ratio=%.6f disable_unpadding=%s",
+                    branch,
+                    int(flat_mask.shape[0]),
+                    int(flat_mask.shape[1]),
+                    valid_tokens / max(1, int(flat_mask.shape[0])),
+                    int(valid_per_sample.max().item()),
+                    1.0 - valid_tokens / max(1, total_tokens),
+                    disable_prompt_unpadding,
+                )
         # step 2: convert from padding to no-padding
         remove_padding_start_ns = time.perf_counter_ns() if timing_enabled else 0
-        batch_td = embeds_padding_2_no_padding(batch_td)
+        if not disable_prompt_unpadding:
+            batch_td = embeds_padding_2_no_padding(batch_td)
         remove_padding_ns = time.perf_counter_ns() - remove_padding_start_ns if timing_enabled else 0
         assign_metadata_start_ns = time.perf_counter_ns() if timing_enabled else 0
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
