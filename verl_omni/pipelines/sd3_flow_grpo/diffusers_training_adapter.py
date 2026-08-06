@@ -14,6 +14,7 @@
 
 """SD3.5 training-side adapter for diffusers-based FlowGRPO."""
 
+import os
 from typing import Optional
 
 import torch
@@ -118,6 +119,36 @@ class StableDiffusion3FlowGRPO(DiffusionModelBase):
 
         selected_latents = latents[:, step]
         selected_timesteps = timesteps[:, step]
+
+        if os.environ.get("BENCH_MODEL_INPUT_STATS") == "1" and torch.is_grad_enabled():
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            call_index = int(getattr(cls, "_benchmark_input_stats_calls", 0))
+            if rank == 0 and call_index < 24:
+                mask_summary = "mask=None"
+                if (
+                    isinstance(prompt_embeds_mask, torch.Tensor)
+                    and not prompt_embeds_mask.is_nested
+                    and prompt_embeds_mask.ndim >= 2
+                ):
+                    flat_mask = prompt_embeds_mask.to(dtype=torch.bool).reshape(prompt_embeds_mask.shape[0], -1)
+                    valid_per_sample = flat_mask.sum(dim=-1)
+                    mask_summary = (
+                        f"mask_shape={tuple(prompt_embeds_mask.shape)} "
+                        f"valid_min={int(valid_per_sample.min().item())} "
+                        f"valid_mean={float(valid_per_sample.float().mean().item()):.3f} "
+                        f"valid_max={int(valid_per_sample.max().item())}"
+                    )
+                print(
+                    "BENCH_MODEL_INPUT "
+                    f"framework=verl_omni call={call_index} "
+                    f"sample_shape={tuple(selected_latents.shape)} "
+                    f"prompt_shape={tuple(prompt_embeds.shape)} "
+                    f"prompt_nested={prompt_embeds.is_nested} "
+                    f"prompt_dtype={prompt_embeds.dtype} "
+                    f"{mask_summary}",
+                    flush=True,
+                )
+            cls._benchmark_input_stats_calls = call_index + 1
 
         model_inputs = cls.build_transformer_inputs(
             latents=selected_latents,
