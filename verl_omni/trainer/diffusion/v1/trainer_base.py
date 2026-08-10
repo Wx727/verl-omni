@@ -127,6 +127,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         self.checkpoint_manager = None
         self.global_steps = 0
         self.local_trigger_step = 0
+        self.parameter_sync_debug = bool(config.trainer.get("parameter_sync_debug", False)) or (
+            os.environ.get("VERL_OMNI_PARAMETER_SYNC_DEBUG") == "1"
+        )
         self._parameter_sync_debug_actor_updates_since_sync = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
@@ -698,7 +701,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return self.reward_loop_manager.compute_rm_score(data)
 
     def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
-        debug_enabled = os.environ.get("VERL_OMNI_PARAMETER_SYNC_DEBUG") == "1"
+        debug_enabled = self.parameter_sync_debug
         if debug_enabled:
             before_size = len(data)
             before_uids = data.non_tensor_batch.get("uid")
@@ -822,7 +825,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
-        if os.environ.get("VERL_OMNI_PARAMETER_SYNC_DEBUG") == "1":
+        if self.parameter_sync_debug:
             self._parameter_sync_debug_actor_updates_since_sync += 1
             logger.warning(
                 "PARAM_SYNC_DEBUG actor_update global_step=%d inner_step=%d updates_since_last_sync=%d batch_size=%d",

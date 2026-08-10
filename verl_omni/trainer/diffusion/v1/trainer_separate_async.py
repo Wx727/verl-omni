@@ -213,7 +213,7 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             should_sync = self.global_steps % self.parameter_sync_step == 0
-            debug_enabled = os.environ.get("VERL_OMNI_PARAMETER_SYNC_DEBUG") == "1"
+            debug_enabled = self.parameter_sync_debug
             if debug_enabled:
                 logger.warning(
                     "PARAM_SYNC_DEBUG sync_decision global_step=%d parameter_sync_step=%d "
