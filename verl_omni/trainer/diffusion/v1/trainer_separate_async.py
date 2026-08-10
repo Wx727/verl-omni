@@ -212,17 +212,33 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            if self.global_steps % self.config.trainer.v1.separate_async.parameter_sync_step == 0:
+            should_sync = self.global_steps % self.parameter_sync_step == 0
+            if self.parameter_sync_step > 1:
+                print(
+                    "PARAM_SYNC_REPRO sync_decision "
+                    f"global_step={self.global_steps} parameter_sync_step={self.parameter_sync_step} "
+                    f"updates_since_last_sync={getattr(self, '_parameter_sync_repro_updates_since_sync', 0)} "
+                    f"should_sync={should_sync} standalone_paused={self._standalone_paused}",
+                    flush=True,
+                )
+            if should_sync:
                 logger.warning(
                     "LORA_SYNC_PROOF separate_async on_step_end: sending weights to "
                     "STANDALONE checkpoint manager (global_steps=%s)",
                     self.global_steps,
                 )
                 self.standalone_checkpoint_manager.update_weights(self.global_steps)
+                self._parameter_sync_repro_updates_since_sync = 0
             if self.sync_compatible and self._standalone_paused:
                 # Sync-compatible mode: resume standalone generation after the
                 # actor update + weight sync so the next generate phase uses
                 # fresh weights, exactly like sync mode waking colocated replicas.
+                if self.parameter_sync_step > 1:
+                    print(
+                        "PARAM_SYNC_REPRO resume_decision "
+                        f"global_step={self.global_steps} resuming_without_sync={not should_sync}",
+                        flush=True,
+                    )
                 self._resume_standalone_generation()
 
     def _pause_standalone_generation(self):

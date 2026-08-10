@@ -243,7 +243,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
-        for _ in range(self.parameter_sync_step):
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
             batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
             metrics.update(iter_metrics)
@@ -695,6 +696,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return self.reward_loop_manager.compute_rm_score(data)
 
     def _balance_batch(self, data: DataProto, metrics: dict) -> DataProto:
+        before_size = len(data)
         dp_size = 1
         if hasattr(self.actor_rollout_wg, "_query_dispatch_info"):
             info = self.actor_rollout_wg._query_dispatch_info("actor")
@@ -708,8 +710,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
         batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
+        pad_size = 0
         if len(data) % batch_multiple != 0:
-            data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+            data, pad_size = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
+        if self.parameter_sync_step > 1:
+            uids = data.non_tensor_batch.get("uid")
+            unique_uids = len(set(map(str, uids.tolist()))) if uids is not None else None
+            print(
+                "PARAM_SYNC_REPRO batch "
+                f"global_step={self.global_steps} inner_step={self.local_trigger_step} "
+                f"before={before_size} after={len(data)} unique_after={unique_uids} "
+                f"pad_size={pad_size} actor_global_mini_batch_size={actor_global_mini_batch_size}",
+                flush=True,
+            )
         return data
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
@@ -795,6 +808,15 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        if self.parameter_sync_step > 1:
+            updates_since_sync = getattr(self, "_parameter_sync_repro_updates_since_sync", 0) + 1
+            self._parameter_sync_repro_updates_since_sync = updates_since_sync
+            print(
+                "PARAM_SYNC_REPRO actor_update "
+                f"global_step={self.global_steps} inner_step={self.local_trigger_step} "
+                f"updates_since_last_sync={updates_since_sync} batch_size={len(data)}",
+                flush=True,
+            )
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
