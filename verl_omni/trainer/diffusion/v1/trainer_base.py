@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -72,6 +73,8 @@ from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     sort_diffusion_tq_keys,
 )
+from verl_omni.utils.benchmark_dispatch_timing import capture_actor_dispatch_timing
+from verl_omni.utils.benchmark_timing import append_benchmark_timing_record, benchmark_timing_enabled
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 from verl_omni.workers.utils.padding import embeds_padding_2_no_padding
 
@@ -126,6 +129,12 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.checkpoint_manager = None
         self.global_steps = 0
+        self._benchmark_details_ns: dict[str, int] = {}
+
+    def _add_benchmark_detail_ns(self, name: str, elapsed_ns: int) -> None:
+        """Accumulate one nested timing detail for the current trainer step."""
+        if benchmark_timing_enabled():
+            self._benchmark_details_ns[name] = self._benchmark_details_ns.get(name, 0) + int(elapsed_ns)
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -183,6 +192,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             is_last_step = self.global_steps >= self.total_training_steps
             metrics: dict = {}
             self.timing_raw: dict = {}
+            self._benchmark_details_ns = {}
             with marked_timer("step", self.timing_raw):
                 self.on_step_begin()
                 batch = self.step(metrics, self.timing_raw)
@@ -205,6 +215,18 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 metrics.update(val_metrics)
 
             self._compute_metrics(batch, metrics, self.timing_raw, self.global_steps, current_epoch)
+            if benchmark_timing_enabled():
+                append_benchmark_timing_record(
+                    framework="verl_omni_v1",
+                    step=self.global_steps,
+                    timing_raw_s=self.timing_raw,
+                    details_ns=self._benchmark_details_ns,
+                    metadata={
+                        "trainer_mode": self.trainer_mode,
+                        "samples_per_step": len(batch.keys),
+                        "n_gpus": self.resource_pool_manager.get_n_gpus(),
+                    },
+                )
 
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
@@ -267,7 +289,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         # Convert TQ rows to diffusion DataProto; from here on the driver owns the
         # DataProto compute contract (no KVBatchMeta passed to diffusion workers).
+        tq_to_dataproto_start_ns = time.perf_counter_ns() if benchmark_timing_enabled() else 0
         data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+        if tq_to_dataproto_start_ns:
+            self._add_benchmark_detail_ns(
+                "tq_to_dataproto",
+                time.perf_counter_ns() - tq_to_dataproto_start_ns,
+            )
 
         # [OPTIONAL] colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
@@ -276,7 +304,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 data = self._compute_reward_colocate(data)
                 self.checkpoint_manager.update_weights(self.global_steps)
 
+        balance_start_ns = time.perf_counter_ns() if benchmark_timing_enabled() else 0
         data = self._balance_batch(data, metrics=metrics)
+        if balance_start_ns:
+            self._add_benchmark_detail_ns("balance_batch", time.perf_counter_ns() - balance_start_ns)
 
         # Bypass mode: skip old_log_prob recompute (2 policies).
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
@@ -325,11 +356,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             data_for_tq = data.select_idxs(list(range(n_keys)))
         else:
             data_for_tq = data
+        tq_writeback_start_ns = time.perf_counter_ns() if benchmark_timing_enabled() else 0
         put_dataproto_fields_to_tq(
             batch_meta,
             data_for_tq,
             fields=["old_log_probs", "advantages", "returns", "sample_level_scores", "sample_level_rewards"],
         )
+        if tq_writeback_start_ns:
+            self._add_benchmark_detail_ns("tq_writeback", time.perf_counter_ns() - tq_writeback_start_ns)
         return batch_meta
 
     def on_init_end(self):
@@ -777,10 +811,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _update_actor(self, data: DataProto) -> DataProto:
         """Update the diffusion actor network."""
+        timing_enabled = benchmark_timing_enabled()
+        prepare_start_ns = time.perf_counter_ns() if timing_enabled else 0
         rollout_config = self.config.actor_rollout_ref.rollout
         data.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        to_tensordict_start_ns = time.perf_counter_ns() if timing_enabled else 0
         batch_td = data.to_tensordict()
+        to_tensordict_ns = time.perf_counter_ns() - to_tensordict_start_ns if timing_enabled else 0
+        remove_padding_start_ns = time.perf_counter_ns() if timing_enabled else 0
         batch_td = embeds_padding_2_no_padding(batch_td)
+        remove_padding_ns = time.perf_counter_ns() - remove_padding_start_ns if timing_enabled else 0
+        assign_metadata_start_ns = time.perf_counter_ns() if timing_enabled else 0
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         tu.assign_non_tensor(
@@ -793,12 +834,60 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             height=self.config.actor_rollout_ref.model.pipeline.height,
             width=self.config.actor_rollout_ref.model.pipeline.width,
             vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+            benchmark_actor_timing=timing_enabled,
         )
-        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        assign_metadata_ns = time.perf_counter_ns() - assign_metadata_start_ns if timing_enabled else 0
+        prepare_ns = time.perf_counter_ns() - prepare_start_ns if timing_enabled else 0
+
+        rpc_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        with capture_actor_dispatch_timing(timing_enabled) as dispatch_timings_ns:
+            actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        rpc_ns = time.perf_counter_ns() - rpc_start_ns if timing_enabled else 0
+
+        worker_timing_collect_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        worker_timings_ns = {}
+        if timing_enabled:
+            timings_by_rank = self.actor_rollout_wg.pop_benchmark_actor_timings()
+            if isinstance(timings_by_rank, dict):
+                timings_by_rank = [timings_by_rank]
+            for name in ("actor_worker_updates", "actor_worker_to_cpu", "actor_worker_total"):
+                values = [int(timing[name]) for timing in timings_by_rank if name in timing]
+                if values:
+                    worker_timings_ns[name] = max(values)
+        worker_timing_collect_ns = time.perf_counter_ns() - worker_timing_collect_start_ns if timing_enabled else 0
+
+        postprocess_start_ns = time.perf_counter_ns() if timing_enabled else 0
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
             actor_output["perf/mfu/actor"] = actor_mfu
+        postprocess_ns = time.perf_counter_ns() - postprocess_start_ns if timing_enabled else 0
+
+        if timing_enabled:
+            timing_ns = {
+                "actor_driver_prepare": prepare_ns,
+                "actor_prepare_to_tensordict": to_tensordict_ns,
+                "actor_prepare_remove_padding": remove_padding_ns,
+                "actor_prepare_assign_metadata": assign_metadata_ns,
+                "actor_prepare_misc": prepare_ns - to_tensordict_ns - remove_padding_ns - assign_metadata_ns,
+                "actor_driver_rpc": rpc_ns,
+                "actor_worker_timing_collect": worker_timing_collect_ns,
+                "actor_driver_postprocess": postprocess_ns,
+                **dispatch_timings_ns,
+                **worker_timings_ns,
+            }
+            worker_total_ns = worker_timings_ns.get("actor_worker_total")
+            if worker_total_ns is not None:
+                timing_ns["actor_rpc_overhead"] = max(0, rpc_ns - worker_total_ns)
+                execute_wait_ns = dispatch_timings_ns.get("actor_execute_wait")
+                if execute_wait_ns is not None:
+                    timing_ns["actor_execute_wait_overhead"] = execute_wait_ns - worker_total_ns
+            dispatch_pipeline_ns = dispatch_timings_ns.get("actor_dispatch_pipeline_total")
+            if dispatch_pipeline_ns is not None:
+                timing_ns["actor_rpc_wrapper_residual"] = rpc_ns - dispatch_pipeline_ns
+            for name, elapsed_ns in timing_ns.items():
+                self._add_benchmark_detail_ns(name, elapsed_ns)
+
         return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
     def _validate(self) -> dict:
@@ -1053,7 +1142,13 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         return metric_dict
 
     def _compute_metrics(self, batch_meta: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        metrics_hydrate_start_ns = time.perf_counter_ns() if benchmark_timing_enabled() else 0
         data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+        if metrics_hydrate_start_ns:
+            self._add_benchmark_detail_ns(
+                "metrics_tq_to_dataproto",
+                time.perf_counter_ns() - metrics_hydrate_start_ns,
+            )
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
         metrics.update(compute_data_metrics_diffusion(batch=data))
         n_gpus = self.resource_pool_manager.get_n_gpus()

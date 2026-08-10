@@ -55,6 +55,7 @@ from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 from verl.workers.utils.losses import ppo_loss
 
+from verl_omni.utils.benchmark_dispatch_timing import make_benchmark_nd_compute_dataproto_dispatch_fn
 from verl_omni.utils.mfu import (
     DiffusionFlopsCounter,
     allgather_diffusion_flops_meta,
@@ -763,12 +764,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @register(dispatch_mode=make_benchmark_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        timing_enabled = bool(tu.pop(data, key="benchmark_actor_timing", default=False))
+        worker_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        train_start_ns = time.perf_counter_ns() if timing_enabled else 0
         output = self.actor.train_mini_batch(data=data)
-        return output.cpu() if output is not None else None
+        train_ns = time.perf_counter_ns() - train_start_ns if timing_enabled else 0
+        to_cpu_start_ns = time.perf_counter_ns() if timing_enabled else 0
+        output = output.cpu() if output is not None else None
+        to_cpu_ns = time.perf_counter_ns() - to_cpu_start_ns if timing_enabled else 0
+        worker_total_ns = time.perf_counter_ns() - worker_start_ns if timing_enabled else 0
+        if timing_enabled:
+            self._benchmark_actor_timings_ns = {
+                "actor_worker_updates": train_ns,
+                "actor_worker_to_cpu": to_cpu_ns,
+                "actor_worker_total": worker_total_ns,
+            }
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def pop_benchmark_actor_timings(self) -> dict[str, int]:
+        """Return and clear this rank's latest opt-in actor timing record."""
+        timings = getattr(self, "_benchmark_actor_timings_ns", {})
+        self._benchmark_actor_timings_ns = {}
+        return timings
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_lora_peft_config(self):
