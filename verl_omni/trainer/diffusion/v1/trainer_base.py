@@ -68,6 +68,7 @@ from verl_omni.trainer.diffusion.rollout_correction import (
     compute_rollout_corr_metrics_from_batch,
     rollout_correction_enabled,
 )
+from verl_omni.trainer.diffusion.v1.metrics import DiffusionMetricsAggregator
 from verl_omni.trainer.diffusion.v1.tq_utils import (
     diffusion_tq_batch_to_dataproto,
     sort_diffusion_tq_keys,
@@ -126,6 +127,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
         self.checkpoint_manager = None
         self.global_steps = 0
+        # Mini-batch index within one parameter-sync cycle. Separate-async
+        # uses this to keep the proximal policy fixed across local updates.
+        self.local_trigger_step = 0
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         sampler_config = self.config.trainer.v1.sampler
@@ -247,21 +251,21 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         with marked_timer("feed", timing_raw):
             self._add_batch_to_generate()
 
+        metrics_aggregator = DiffusionMetricsAggregator()
         combined_keys: list = []
         combined_tags: list = []
         combined_partition_id = "train"
-        for _ in range(self.parameter_sync_step):
+        for trigger_idx in range(self.parameter_sync_step):
+            self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
             batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
-            for key, value in iter_metrics.items():
-                if key.startswith("training/rollout_failure/"):
-                    metrics[key] = metrics.get(key, 0) + value
-                else:
-                    metrics[key] = value
+            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+            metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
             combined_keys.extend(batch.keys)
             combined_tags.extend(batch.tags)
             combined_partition_id = batch.partition_id
 
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
@@ -813,7 +817,17 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
         batch_multiple = math.lcm(dp_size, actor_global_mini_batch_size)
+        if self.trainer_mode == "separate_async" and len(data) != actor_global_mini_batch_size:
+            raise ValueError(
+                "separate_async local batch must contain exactly "
+                f"ppo_mini_batch_size * rollout.n = {actor_global_mini_batch_size} trajectories, "
+                f"but received {len(data)}; refusing to pad copied trajectories"
+            )
         if len(data) % batch_multiple != 0:
+            if self.trainer_mode == "separate_async":
+                raise ValueError(
+                    f"separate_async local batch size {len(data)} must be divisible by actor DP size {dp_size}"
+                )
             data, _ = pad_dataproto_to_divisor(data, size_divisor=batch_multiple)
         return data
 

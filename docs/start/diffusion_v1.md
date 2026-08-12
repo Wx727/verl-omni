@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 08/06/2026
+Last updated: 08/11/2026
 
 This guide runs the diffusion V1 trainer in synchronous mode using the provided
 Stable Diffusion 3.5 Medium FlowGRPO OCR recipe. The V1 trainer uses
@@ -94,7 +94,8 @@ checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
 
 - `trainer.use_v1=true` selects the V1 trainer instead of the legacy diffusion
   trainer.
-- `trainer.v1.trainer_mode=sync` selects synchronous rollout and training.
+- `trainer.v1.trainer_mode=sync` selects synchronous rollout and training;
+  `separate_async` uses dedicated rollout GPUs.
 - `actor_rollout_ref.rollout.agent.num_workers` controls the rollout worker
   count.
 - `trainer.v1.sampler.drop_incomplete_groups=true` evicts a training prompt
@@ -109,9 +110,26 @@ checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
 - `transfer_queue.backend.SimpleStorage.num_data_storage_units` controls the
   number of in-memory storage units.
 
-This guide and the incomplete-group refill policy cover `sync` mode.
-`separate_async` keeps the upstream replay-buffer behavior, while
-`colocate_async` is not yet supported.
+For `separate_async`, `trainer.v1.separate_async.parameter_sync_step=N`
+performs `N` local actor updates, then synchronizes the resulting actor weights
+to standalone rollout replicas. When old log-probabilities are recomputed, all
+`N` updates use one fixed proximal policy; rollout-correction bypass mode uses
+the log-probabilities stored with each rollout instead. The batch sizes must
+satisfy:
+
+```text
+data.train_batch_size =
+    trainer.v1.separate_async.parameter_sync_step
+    * actor_rollout_ref.actor.ppo_mini_batch_size
+```
+
+Standalone rollout weights are synchronized after every outer step. With
+`sync_compatible=true`, generation pauses during the local updates and resumes
+only after that synchronization. See
+`examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1_separate_async.sh`
+for a complete configuration.
+
+`colocate_async` is not currently implemented for diffusion V1.
 
 ## Troubleshooting
 
