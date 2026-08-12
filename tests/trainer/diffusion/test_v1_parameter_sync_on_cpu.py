@@ -318,7 +318,7 @@ def test_on_step_end_does_not_resume_after_failed_sync():
 @pytest.mark.parametrize(
     ("strategy", "save_handler_name", "restore_handler_name"),
     [
-        ("fsdp", "fsdp1_sharded_save_to_cpu", "fsdp1_sharded_load_from_cpu"),
+        ("fsdp", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
         ("fsdp2", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
         ("veomni", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
     ],
@@ -351,8 +351,8 @@ def test_snapshot_worker_materializes_and_reoffloads_parameters(monkeypatch):
 
     worker.actor = SimpleNamespace(engine=_FakeEngine())
     worker._strategy_handlers = (
-        lambda actor_module: actor_module.weight.detach().clone(),
-        lambda actor_module, state: actor_module.weight.data.copy_(state),
+        lambda actor_module: (actor_module.weight.detach().clone(), "test-spec"),
+        lambda actor_module, state, _global_spec: actor_module.weight.data.copy_(state),
     )
     worker.cpu_saved_models = {}
     monkeypatch.setattr(detach_actor_worker_module, "get_device_name", lambda: "cuda")
@@ -395,10 +395,9 @@ def test_snapshot_worker_reoffloads_after_materialization_failure(monkeypatch):
     assert worker.cpu_saved_models == {}
 
 
-def test_fsdp1_snapshot_round_trip_includes_lora_parameters(monkeypatch):
+def test_snapshot_round_trip_includes_lora_parameters():
     worker = object.__new__(DiffusionDetachActorWorker)
     worker.config = OmegaConf.create({"actor": {"strategy": "fsdp"}})
-    worker._strategy_handlers = None
     worker.cpu_saved_models = {}
 
     class _LoRAModule(torch.nn.Module):
@@ -412,7 +411,18 @@ def test_fsdp1_snapshot_round_trip_includes_lora_parameters(monkeypatch):
     worker.actor = SimpleNamespace(
         engine=SimpleNamespace(module=module, is_param_offload_enabled=False),
     )
-    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    def save_state(actor_module):
+        state = {name: param.detach().clone() for name, param in actor_module.named_parameters()}
+        return state, "test-spec"
+
+    def restore_state(actor_module, state, global_spec):
+        assert global_spec == "test-spec"
+        with torch.no_grad():
+            for name, param in actor_module.named_parameters():
+                param.copy_(state[name])
+
+    worker._strategy_handlers = (save_state, restore_state)
 
     original = {name: param.detach().clone() for name, param in module.named_parameters()}
     worker.save_model_to_cpu(0)

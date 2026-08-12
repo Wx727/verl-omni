@@ -20,7 +20,7 @@ from typing import Any, Optional
 from omegaconf import DictConfig
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_name
-from verl.workers.config import DistillationConfig
+from verl.workers.config.distillation import DistillationConfig
 
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
@@ -40,14 +40,7 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker):
             return self._strategy_handlers
 
         strategy = self.config.actor.strategy
-        if strategy == "fsdp":
-            from verl.utils.fsdp_utils import (
-                fsdp1_sharded_load_from_cpu,
-                fsdp1_sharded_save_to_cpu,
-            )
-
-            handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
-        elif strategy in ("fsdp2", "veomni"):
+        if strategy in ("fsdp", "fsdp2", "veomni"):
             from verl.utils.fsdp_utils import (
                 fsdp2_sharded_load_from_cpu,
                 fsdp2_sharded_save_to_cpu,
@@ -102,7 +95,7 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker):
 
         saved_model = self.cpu_saved_models[snapshot_id]
         with self._actor_model_for_snapshot() as module:
-            if self.config.actor.strategy in ("fsdp2", "veomni"):
+            if self.config.actor.strategy in ("fsdp", "fsdp2", "veomni"):
                 cpu_sharded_state, global_spec = saved_model
                 self.restore_handler(module, cpu_sharded_state, global_spec)
             else:
