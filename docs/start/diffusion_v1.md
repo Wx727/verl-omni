@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 08/11/2026
+Last updated: 08/12/2026
 
 This guide runs the diffusion V1 trainer in synchronous mode using the provided
 Stable Diffusion 3.5 Medium FlowGRPO OCR recipe. The V1 trainer uses
