@@ -91,7 +91,7 @@ def test_base_step_samples_one_mini_batch_per_local_update():
 
     trainer._step_once = step_once
     metrics = {}
-    batch = trainer.step(metrics, {})
+    batch = PolicyGradientDiffusionTrainerV1.step(trainer, metrics, {})
 
     assert sample_sizes == [2, 2, 2, 2]
     assert local_steps == [0, 1, 2, 3]
