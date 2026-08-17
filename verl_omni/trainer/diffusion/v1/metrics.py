@@ -19,7 +19,6 @@ from typing import Any
 import numpy as np
 import torch
 
-
 _DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 
 
@@ -81,9 +80,7 @@ class DiffusionMetricsAggregator:
 
     def _get_aggregation_type(self, metric_name: str) -> str:
         if "/rollout_failure/" in metric_name and (
-            metric_name.endswith(
-                ("/evicted_groups", "/evicted_trajectories", "/refilled_prompts", "/refill_rounds")
-            )
+            metric_name.endswith(("/evicted_groups", "/evicted_trajectories", "/refilled_prompts", "/refill_rounds"))
             or ("/reason/" in metric_name and metric_name.endswith("_groups"))
         ):
             return "sum"
@@ -133,9 +130,7 @@ class DiffusionMetricsAggregator:
             if counter:
                 aggregated[name] = dict(counter)
         if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
-            aggregated["global_seqlen/minmax_diff"] = (
-                aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
-            )
+            aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
         return aggregated
 
     def reset(self) -> None:
