@@ -106,6 +106,11 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         assert config.actor_rollout_ref.rollout.checkpoint_engine.backend != "naive", (
             "please use nccl/nixl/mooncake/... backend for separate async training"
         )
+        separate_async_config = config.trainer.v1.separate_async
+        assert (
+            not separate_async_config.get("sync_compatible", False)
+            or separate_async_config.get("num_warmup_batches", 0) == 0
+        ), "sync_compatible=True requires num_warmup_batches=0"
 
         super().__init__(config)
 
@@ -150,6 +155,10 @@ class PolicyGradientDiffusionTrainerV1SeparateAsync(PolicyGradientDiffusionTrain
         finally:
             if self.parameter_sync_step > 1:
                 self.actor_rollout_wg.clear_cpu_model(0)
+
+    def _should_prefetch_local_batches(self) -> bool:
+        """Collect the full cycle before pausing sync-compatible rollout."""
+        return self.sync_compatible and self.parameter_sync_step > 1
 
     def _init_online_rollout_stack(self, actor_rollout_resource_pool):
         """Build colocated rollout stack (naive ckpt) + standalone rollout stack.
