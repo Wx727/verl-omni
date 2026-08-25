@@ -20,9 +20,9 @@ import torch
 from omegaconf import OmegaConf
 from transfer_queue import KVBatchMeta
 from verl import DataProto
+from verl.experimental.separation.engine_workers import DetachActorWorker
+from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
 
-from verl_omni.trainer.diffusion.v1 import trainer_base as trainer_base_module
-from verl_omni.trainer.diffusion.v1.metrics import DiffusionMetricsAggregator
 from verl_omni.trainer.diffusion.v1.trainer_base import PolicyGradientDiffusionTrainerV1
 from verl_omni.trainer.diffusion.v1.trainer_separate_async import (
     PolicyGradientDiffusionTrainerV1SeparateAsync,
@@ -45,7 +45,11 @@ def _separate_async_config(*, train_batch_size=8, ppo_mini_batch_size=2, paramet
             },
             "trainer": {
                 "v1": {
-                    "separate_async": {"parameter_sync_step": parameter_sync_step},
+                    "separate_async": {
+                        "parameter_sync_step": parameter_sync_step,
+                        "num_warmup_batches": 0,
+                        "sync_compatible": True,
+                    },
                 }
             },
         }
@@ -60,14 +64,18 @@ def test_separate_async_validates_parameter_sync_batches(monkeypatch):
         (_separate_async_config(train_batch_size=7), r"parameter_sync_step \* ppo_mini_batch_size"),
         (_separate_async_config(parameter_sync_step=0), "must be positive"),
     ]
+    warmup_config = _separate_async_config()
+    warmup_config.trainer.v1.separate_async.num_warmup_batches = 1
+    invalid_configs.append((warmup_config, "requires num_warmup_batches=0"))
     for config, error in invalid_configs:
         with pytest.raises(AssertionError, match=error):
             PolicyGradientDiffusionTrainerV1SeparateAsync(config)
 
 
-def test_separate_async_replay_buffer_counts_outer_step_versions():
+def test_separate_async_uses_upstream_async_replay_buffer():
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
     trainer.trainer_mode = "separate_async"
+    trainer._add_prompts_to_generate = lambda count: count
     trainer.config = OmegaConf.create(
         {
             "trainer": {
@@ -86,13 +94,15 @@ def test_separate_async_replay_buffer_counts_outer_step_versions():
 
     replay_buffer = trainer._build_replay_buffer()
 
-    assert replay_buffer.parameter_sync_step == 1
+    assert isinstance(replay_buffer, ReplayBufferAsync)
+    assert replay_buffer.refill_fn is trainer._add_prompts_to_generate
 
 
 def test_base_step_samples_one_mini_batch_per_local_update():
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
     trainer.config = OmegaConf.create({"data": {"train_batch_size": 8}})
     trainer.parameter_sync_step = 4
+    trainer.sync_compatible = False
     sample_sizes = []
     local_steps = []
 
@@ -103,7 +113,7 @@ def test_base_step_samples_one_mini_batch_per_local_update():
         sample_sizes.append(sample_batch_size)
         local_steps.append(trainer.local_trigger_step)
         iter_metrics["actor/loss/mean"] = float(trainer.local_trigger_step)
-        iter_metrics["training/rollout_failure/refilled_prompts"] = 1
+        iter_metrics["training/off_policy/evicted_samples"] = 1
         return KVBatchMeta(
             partition_id="train",
             keys=[f"sample-{trainer.local_trigger_step}"],
@@ -118,7 +128,7 @@ def test_base_step_samples_one_mini_batch_per_local_update():
     assert local_steps == [0, 1, 2, 3]
     assert batch.keys == ["sample-0", "sample-1", "sample-2", "sample-3"]
     assert metrics["actor/loss/mean"] == pytest.approx(1.5)
-    assert metrics["training/rollout_failure/refilled_prompts"] == 4
+    assert metrics["training/off_policy/evicted_samples"] == 4
 
 
 @pytest.mark.parametrize(
@@ -149,137 +159,55 @@ def test_separate_async_refuses_to_pad_invalid_local_batch(batch_size, dp_size, 
         trainer._balance_batch(data, {})
 
 
-def test_separate_async_refills_stale_groups_without_padding():
+def test_separate_async_uses_single_prompt_generation_batches_for_exact_refill():
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
     trainer.trainer_mode = "separate_async"
-    trainer.global_steps = 5
     trainer.config = OmegaConf.create(
         {
-            "actor_rollout_ref": {"rollout": {"n": 2}},
-            "trainer": {"v1": {"sampler": {"max_incomplete_group_refill_rounds": 3}}},
+            "data": {"train_batch_size": 8, "gen_batch_size": 8},
+            "trainer": {"v1": {"sampler": {"drop_incomplete_groups": False}}},
         }
     )
-    responses = [
-        (
-            KVBatchMeta(
-                partition_id="train",
-                keys=["kept_0_0", "kept_1_0"],
-                tags=[{"global_steps": 5}, {"global_steps": 5}],
-            ),
-            {
-                "training/off_policy/dropped_samples": 2,
-                "training/off_policy/dropped_samples_staleness/mean": 3.0,
-            },
-        ),
-        (
-            KVBatchMeta(
-                partition_id="train",
-                keys=["replacement_0_0", "replacement_1_0"],
-                tags=[{"global_steps": 5}, {"global_steps": 5}],
-            ),
-            {},
-        ),
-    ]
-    sample_sizes = []
-    trainer.replay_buffer = SimpleNamespace(
-        sample=lambda **kwargs: sample_sizes.append(kwargs["batch_size"]) or responses.pop(0)
-    )
-    submitted = []
-    trainer._generation_batch_size = lambda: 4
-    trainer._add_prompts_to_generate = lambda count: submitted.append(count) or count
 
-    batch, metrics = trainer._sample_training_batch(2)
-
-    assert sample_sizes == [2, 1]
-    assert submitted == [4]
-    assert batch.keys == ["kept_0_0", "kept_1_0", "replacement_0_0", "replacement_1_0"]
-    assert metrics["training/off_policy/dropped_samples"] == 2
-    assert metrics["training/off_policy/dropped_samples_staleness/mean"] == pytest.approx(3.0)
+    assert trainer._generation_batch_size() == 1
 
 
-def test_separate_async_refills_incomplete_groups_without_padding(monkeypatch):
+def test_sync_compatible_prefetches_all_local_batches_before_training():
     trainer = object.__new__(PolicyGradientDiffusionTrainerV1SeparateAsync)
-    trainer.trainer_mode = "separate_async"
-    trainer.global_steps = 1
-    trainer.config = OmegaConf.create(
-        {
-            "actor_rollout_ref": {"rollout": {"n": 2}},
-            "trainer": {"v1": {"sampler": {"max_incomplete_group_refill_rounds": 3}}},
-        }
-    )
-    responses = [
-        (
+    trainer.config = OmegaConf.create({"data": {"train_batch_size": 4}})
+    trainer.parameter_sync_step = 2
+    trainer.sync_compatible = True
+    events = []
+    trainer._add_batch_to_generate = lambda: events.append("feed")
+    trainer.on_sample_begin = lambda: events.append("sample_begin")
+    trainer.on_sample_end = lambda: events.append("sample_end")
+
+    def sample(batch_size):
+        step = trainer.local_trigger_step
+        events.append(f"sample_{step}")
+        return (
             KVBatchMeta(
                 partition_id="train",
-                keys=["partial_0_0"],
-                tags=[{"global_steps": 1}],
+                keys=[f"sample-{step}"],
+                tags=[{"is_padding": False}],
             ),
             {},
-        ),
-        (
-            KVBatchMeta(
-                partition_id="train",
-                keys=["replacement_0_0", "replacement_1_0"],
-                tags=[{"global_steps": 1}, {"global_steps": 1}],
-            ),
-            {},
-        ),
-    ]
-    sample_sizes = []
-    trainer.replay_buffer = SimpleNamespace(
-        sample=lambda **kwargs: sample_sizes.append(kwargs["batch_size"]) or responses.pop(0)
-    )
-    submitted = []
-    cleared = []
-    trainer._generation_batch_size = lambda: 1
-    trainer._add_prompts_to_generate = lambda count: submitted.append(count) or count
-    monkeypatch.setattr(
-        trainer_base_module.tq,
-        "kv_clear",
-        lambda *, partition_id, keys: cleared.append((partition_id, list(keys))),
-    )
+        )
 
-    batch, metrics = trainer._sample_training_batch(1)
+    def train(iter_metrics, _timing_raw, batch):
+        events.append(f"train_{trainer.local_trigger_step}")
+        iter_metrics["actor/loss/mean"] = float(trainer.local_trigger_step)
+        return batch
 
-    assert sample_sizes == [1, 1]
-    assert submitted == [1]
-    assert cleared == [("train", ["partial_0_0"])]
-    assert batch.keys == ["replacement_0_0", "replacement_1_0"]
-    assert metrics["training/rollout_failure/evicted_groups"] == 1
-    assert metrics["training/rollout_failure/evicted_trajectories"] == 1
-    assert metrics["training/rollout_failure/refilled_prompts"] == 1
-    assert metrics["training/rollout_failure/refill_rounds"] == 1
+    trainer._sample_training_batch = sample
+    trainer._train_sampled_batch = train
 
+    metrics = {}
+    batch = PolicyGradientDiffusionTrainerV1.step(trainer, metrics, {})
 
-def test_metrics_aggregator_sums_rollout_failure_counts():
-    aggregator = DiffusionMetricsAggregator()
-    aggregator.add_step_metrics(
-        {
-            "training/rollout_failure/refilled_prompts": 1,
-            "training/off_policy/dropped_samples": 2,
-            "training/off_policy/dropped_samples_staleness/mean": 10.0,
-            "actor/loss/mean": 2.0,
-            "actor/lr": 1e-4,
-        },
-        sample_count=1,
-    )
-    aggregator.add_step_metrics(
-        {
-            "training/rollout_failure/refilled_prompts": 3,
-            "training/off_policy/dropped_samples": 6,
-            "training/off_policy/dropped_samples_staleness/mean": 2.0,
-            "actor/loss/mean": 4.0,
-            "actor/lr": 2e-4,
-        },
-        sample_count=3,
-    )
-
-    metrics = aggregator.get_aggregated_metrics()
-    assert metrics["training/rollout_failure/refilled_prompts"] == 4
-    assert metrics["training/off_policy/dropped_samples"] == 8
-    assert metrics["training/off_policy/dropped_samples_staleness/mean"] == pytest.approx(4.0)
-    assert metrics["actor/loss/mean"] == pytest.approx(3.5)
-    assert metrics["actor/lr"] == pytest.approx(2e-4)
+    assert events == ["feed", "sample_begin", "sample_0", "sample_1", "sample_end", "train_0", "train_1"]
+    assert batch.keys == ["sample-0", "sample-1"]
+    assert metrics["actor/loss/mean"] == pytest.approx(0.5)
 
 
 class _FakeSnapshotWorkerGroup:
@@ -347,12 +275,13 @@ def test_on_step_end_syncs_every_outer_step():
 @pytest.mark.parametrize(
     ("strategy", "save_handler_name", "restore_handler_name"),
     [
-        ("fsdp", "_fsdp1_sharded_save_to_cpu", "_fsdp1_sharded_load_from_cpu"),
+        ("fsdp", "fsdp1_sharded_save_to_cpu", "fsdp1_sharded_load_from_cpu"),
         ("fsdp2", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
         ("veomni", "fsdp2_sharded_save_to_cpu", "fsdp2_sharded_load_from_cpu"),
     ],
 )
 def test_snapshot_worker_selects_sharded_strategy_handlers(strategy, save_handler_name, restore_handler_name):
+    assert issubclass(DiffusionDetachActorWorker, DetachActorWorker)
     worker = object.__new__(DiffusionDetachActorWorker)
     worker.config = OmegaConf.create({"actor": {"strategy": strategy}})
     worker._strategy_handlers = None
@@ -380,15 +309,20 @@ def test_snapshot_worker_materializes_and_reoffloads_parameters(monkeypatch):
 
     worker.actor = SimpleNamespace(engine=_FakeEngine())
     worker._strategy_handlers = (
-        lambda actor_module: (actor_module.weight.detach().clone(), "test-spec"),
+        lambda actor_module: (actor_module.weight.detach(), "test-spec"),
         lambda actor_module, state, _global_spec: actor_module.weight.data.copy_(state),
     )
     worker.cpu_saved_models = {}
     monkeypatch.setattr(detach_actor_worker_module, "get_device_name", lambda: "cuda")
 
+    original_weight = module.weight.detach().clone()
     worker.save_model_to_cpu(0)
+    with torch.no_grad():
+        module.weight.add_(1)
+    assert torch.equal(worker.cpu_saved_models[0][0], original_weight)
     worker.restore_model_from_cpu(0)
 
+    assert torch.equal(module.weight, original_weight)
     assert device_transitions == [
         ("cuda", True, False, False),
         ("cpu", True, False, False),

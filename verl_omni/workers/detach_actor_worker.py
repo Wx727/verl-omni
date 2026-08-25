@@ -13,13 +13,13 @@
 # limitations under the License.
 """Diffusion-aware actor worker with local CPU parameter snapshots."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Optional
 
 import torch
-import torch.distributed as dist
 from omegaconf import DictConfig
+from verl.experimental.separation.engine_workers import DetachActorWorker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_name
 from verl.workers.config.distillation import DistillationConfig
@@ -27,70 +27,28 @@ from verl.workers.config.distillation import DistillationConfig
 from verl_omni.workers.engine_workers import ActorRolloutRefWorker
 
 
-def _fsdp1_sharded_save_to_cpu(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Copy this rank's local FSDP1 parameter shards to CPU."""
-    cpu_sharded_state = {}
-    for param_name, param in model.named_parameters():
-        cpu_sharded_state[param_name] = param.detach().to("cpu", copy=True)
-    return cpu_sharded_state
+def _clone_cpu_tensors(value):
+    """Make snapshot tensors independent from CPU-offloaded parameters."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu", copy=True)
+    if isinstance(value, dict):
+        return {key: _clone_cpu_tensors(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_cpu_tensors(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_cpu_tensors(item) for item in value]
+    return value
 
 
-def _fsdp1_sharded_load_from_cpu(model: torch.nn.Module, cpu_sharded_state: dict[str, torch.Tensor]) -> None:
-    """Restore this rank's local FSDP1 parameter shards from CPU."""
-    with torch.no_grad():
-        for param_name, param in model.named_parameters():
-            if param_name not in cpu_sharded_state:
-                continue
-            param.copy_(cpu_sharded_state[param_name].to(param.device))
-
-    if dist.is_initialized():
-        dist.barrier()
-
-
-class DiffusionDetachActorWorker(ActorRolloutRefWorker):
-    """Add sharded CPU save/restore RPCs to the verl-omni hybrid worker."""
+class DiffusionDetachActorWorker(ActorRolloutRefWorker, DetachActorWorker):
+    """Use verl's detach handlers with the verl-omni hybrid actor."""
 
     def __init__(
         self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
     ):
-        super().__init__(config, role, distillation_config=distillation_config, **kwargs)
-        self._strategy_handlers: tuple[Callable, Callable] | None = None
+        ActorRolloutRefWorker.__init__(self, config, role, distillation_config=distillation_config, **kwargs)
+        self._strategy_handlers = None
         self.cpu_saved_models: dict[int, Any] = {}
-
-    def _get_strategy_handlers(self) -> tuple[Callable, Callable]:
-        if self._strategy_handlers is not None:
-            return self._strategy_handlers
-
-        strategy = self.config.actor.strategy
-        if strategy == "fsdp":
-            handlers = (_fsdp1_sharded_save_to_cpu, _fsdp1_sharded_load_from_cpu)
-        elif strategy in ("fsdp2", "veomni"):
-            from verl.utils.fsdp_utils import (
-                fsdp2_sharded_load_from_cpu,
-                fsdp2_sharded_save_to_cpu,
-            )
-
-            handlers = (fsdp2_sharded_save_to_cpu, fsdp2_sharded_load_from_cpu)
-        elif strategy == "megatron":
-            from verl.utils.megatron_utils import (
-                copy_megatron_model_to_cpu,
-                restore_megatron_model_from_cpu,
-            )
-
-            handlers = (copy_megatron_model_to_cpu, restore_megatron_model_from_cpu)
-        else:
-            raise NotImplementedError(f"Unsupported strategy: {strategy}")
-
-        self._strategy_handlers = handlers
-        return handlers
-
-    @property
-    def copy_handler(self) -> Callable:
-        return self._get_strategy_handlers()[0]
-
-    @property
-    def restore_handler(self) -> Callable:
-        return self._get_strategy_handlers()[1]
 
     @contextmanager
     def _actor_model_for_snapshot(self) -> Iterator[Any]:
@@ -109,7 +67,7 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker):
     def save_model_to_cpu(self, snapshot_id: int) -> None:
         """Save this rank's current actor parameter shard to CPU."""
         with self._actor_model_for_snapshot() as module:
-            self.cpu_saved_models[snapshot_id] = self.copy_handler(module)
+            self.cpu_saved_models[snapshot_id] = _clone_cpu_tensors(self.copy_handler(module))
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_model_from_cpu(self, snapshot_id: int) -> None:
@@ -124,8 +82,3 @@ class DiffusionDetachActorWorker(ActorRolloutRefWorker):
                 self.restore_handler(module, cpu_sharded_state, global_spec)
             else:
                 self.restore_handler(module, saved_model)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def clear_cpu_model(self, snapshot_id: int) -> None:
-        """Release a CPU actor snapshot."""
-        self.cpu_saved_models.pop(snapshot_id, None)
